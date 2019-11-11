@@ -44,6 +44,7 @@ def make_hparams():
         step_decay=True, # note that disabling step decay is not implemented
         step_decay_factor=0.5,
         step_decay_patience=5,
+        max_consecutive_decays=3, # establishes a termination criterion
 
         partitioned=True,
         num_layers_position_only=0,
@@ -54,6 +55,8 @@ def make_hparams():
         d_kv=64,
         d_ff=2048,
         d_label_hidden=250,
+        d_tag_hidden=250,
+        tag_loss_scale=5.0,
 
         attention_dropout=0.2,
         embedding_dropout=0.0,
@@ -63,8 +66,10 @@ def make_hparams():
         use_tags=False,
         use_words=False,
         use_chars_lstm=False,
-        use_chars_concat=False,
         use_elmo=False,
+        use_bert=False,
+        use_bert_only=False,
+        predict_tags=False,
 
         d_char_emb=32, # A larger value may be better for use_chars_lstm
 
@@ -74,6 +79,10 @@ def make_hparams():
         timing_dropout=0.0,
         char_lstm_input_dropout=0.2,
         elmo_dropout=0.5, # Note that this semi-stacks with morpho_emb_dropout!
+
+        bert_model="bert-base-uncased",
+        bert_do_lower_case=True,
+        bert_transliterate="",
         )
 
 def run_train(args, hparams):
@@ -96,6 +105,10 @@ def run_train(args, hparams):
     hparams.print()
 
     print("Loading training trees from {}...".format(args.train_path))
+    if hparams.predict_tags and args.train_path.endswith('10way.clean'):
+        print("WARNING: The data distributed with this repository contains "
+              "predicted part-of-speech tags only (not gold tags!) We do not "
+              "recommend enabling predict_tags in this configuration.")
     train_treebank = trees.load_trees(args.train_path)
     if hparams.max_len_train > 0:
         train_treebank = [tree for tree in train_treebank if len(list(tree.leaves())) <= hparams.max_len_train]
@@ -228,12 +241,14 @@ def run_train(args, hparams):
     check_every = len(train_parse) / args.checks_per_epoch
     best_dev_fscore = -np.inf
     best_dev_model_path = None
+    best_dev_processed = 0
 
     start_time = time.time()
 
     def check_dev():
         nonlocal best_dev_fscore
         nonlocal best_dev_model_path
+        nonlocal best_dev_processed
 
         dev_start_time = time.time()
 
@@ -269,6 +284,7 @@ def run_train(args, hparams):
             best_dev_fscore = dev_fscore.fscore
             best_dev_model_path = "{}_dev={:.2f}".format(
                 args.model_path_base, dev_fscore.fscore)
+            best_dev_processed = total_processed
             print("Saving new best model to {}...".format(best_dev_model_path))
             torch.save({
                 'spec': parser.spec,
@@ -290,11 +306,15 @@ def run_train(args, hparams):
             batch_loss_value = 0.0
             batch_trees = train_parse[start_index:start_index + args.batch_size]
             batch_sentences = [[(leaf.tag, leaf.word) for leaf in tree.leaves()] for tree in batch_trees]
+            batch_num_tokens = sum(len(sentence) for sentence in batch_sentences)
 
             for subbatch_sentences, subbatch_trees in parser.split_batch(batch_sentences, batch_trees, args.subbatch_max_tokens):
                 _, loss = parser.parse_batch(subbatch_sentences, subbatch_trees)
 
-                loss = loss / len(batch_trees)
+                if hparams.predict_tags:
+                    loss = loss[0] / len(batch_trees) + loss[1] / batch_num_tokens
+                else:
+                    loss = loss / len(batch_trees)
                 loss_value = float(loss.data.cpu().numpy())
                 batch_loss_value += loss_value
                 if loss_value > 0:
@@ -303,7 +323,7 @@ def run_train(args, hparams):
                 total_processed += len(subbatch_trees)
                 current_processed += len(subbatch_trees)
 
-            grad_norm = torch.nn.utils.clip_grad_norm(clippable_parameters, grad_clip_threshold)
+            grad_norm = torch.nn.utils.clip_grad_norm_(clippable_parameters, grad_clip_threshold)
 
             trainer.step()
 
@@ -331,9 +351,11 @@ def run_train(args, hparams):
                 check_dev()
 
         # adjust learning rate at the end of an epoch
-        if hparams.step_decay:
-            if (total_processed // args.batch_size + 1) > hparams.learning_rate_warmup_steps:
-                scheduler.step(best_dev_fscore)
+        if (total_processed // args.batch_size + 1) > hparams.learning_rate_warmup_steps:
+            scheduler.step(best_dev_fscore)
+            if (total_processed - best_dev_processed) > ((hparams.step_decay_patience + 1) * hparams.max_consecutive_decays * len(train_parse)):
+                print("Terminating due to lack of improvement in dev fscore.")
+                break
 
 def run_test(args):
     print("Loading test trees from {}...".format(args.test_path))
@@ -435,6 +457,52 @@ def run_ensemble(args):
     )
 
 #%%
+
+def run_parse(args):
+    if args.output_path != '-' and os.path.exists(args.output_path):
+        print("Error: output file already exists:", args.output_path)
+        return
+
+    print("Loading model from {}...".format(args.model_path_base))
+    assert args.model_path_base.endswith(".pt"), "Only pytorch savefiles supported"
+
+    info = torch_load(args.model_path_base)
+    assert 'hparams' in info['spec'], "Older savefiles not supported"
+    parser = parse_nk.NKChartParser.from_spec(info['spec'], info['state_dict'])
+
+    print("Parsing sentences...")
+    with open(args.input_path) as input_file:
+        sentences = input_file.readlines()
+    sentences = [sentence.split() for sentence in sentences]
+
+    # Tags are not available when parsing from raw text, so use a dummy tag
+    if 'UNK' in parser.tag_vocab.indices:
+        dummy_tag = 'UNK'
+    else:
+        dummy_tag = parser.tag_vocab.value(0)
+
+    start_time = time.time()
+
+    all_predicted = []
+    for start_index in range(0, len(sentences), args.eval_batch_size):
+        subbatch_sentences = sentences[start_index:start_index+args.eval_batch_size]
+
+        subbatch_sentences = [[(dummy_tag, word) for word in sentence] for sentence in subbatch_sentences]
+        predicted, _ = parser.parse_batch(subbatch_sentences)
+        del _
+        if args.output_path == '-':
+            for p in predicted:
+                print(p.convert().linearize())
+        else:
+            all_predicted.extend([p.convert() for p in predicted])
+
+    if args.output_path != '-':
+        with open(args.output_path, 'w') as output_file:
+            for tree in all_predicted:
+                output_file.write("{}\n".format(tree.linearize()))
+        print("Output written to:", args.output_path)
+
+#%%
 def run_viz(args):
     assert args.model_path_base.endswith(".pt"), "Only pytorch savefiles supported"
 
@@ -520,6 +588,13 @@ def main():
     subparser.add_argument("--model-path-base", nargs='+', required=True)
     subparser.add_argument("--evalb-dir", default="EVALB/")
     subparser.add_argument("--test-path", default="data/22.auto.clean")
+    subparser.add_argument("--eval-batch-size", type=int, default=100)
+
+    subparser = subparsers.add_parser("parse")
+    subparser.set_defaults(callback=run_parse)
+    subparser.add_argument("--model-path-base", required=True)
+    subparser.add_argument("--input-path", type=str, required=True)
+    subparser.add_argument("--output-path", type=str, default="-")
     subparser.add_argument("--eval-batch-size", type=int, default=100)
 
     subparser = subparsers.add_parser("viz")

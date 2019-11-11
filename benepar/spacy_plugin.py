@@ -51,7 +51,7 @@ class BeneparComponent(BaseParser):
     Sample usage:
     >>> nlp = spacy.load('en')
     >>> nlp.add_pipe(BeneparComponent("benepar_en"))
-    >>> doc = nlp("The quick brown fox jumps over the lazy dog.")
+    >>> doc = nlp(u"The quick brown fox jumps over the lazy dog.")
     >>> sent = list(doc.sents)[0]
     >>> print(sent._.parse_string)
 
@@ -62,19 +62,25 @@ class BeneparComponent(BaseParser):
 
     name = 'benepar'
 
-    def __init__(self, filename, batch_size=64):
+    def __init__(self, filename, batch_size=64, disable_tagger=False):
         """
         Load a parsing model given a short model name (e.g. "benepar_en") or a
         filename on disk.
 
         name (str): Model name, or path to uncompressed TensorFlow model graph
         batch_size (int): Maximum number of sentences to process per batch
+        disable_tagger (bool, default False): Unless disabled, the parser will
+            set predicted part-of-speech tags for the document, overwriting any
+            existing tags provided by spaCy models or previous pipeline steps.
+            This option has no effect for older parser models that do not have
+            a tagger built in.
         """
         super(BeneparComponent, self).__init__(filename, batch_size)
+        self._do_tagging = (self._provides_tags and not disable_tagger)
 
     def __call__(self, doc):
         constituent_data = PartialConstituentData()
-        for parse_raw, sent in self._batched_parsed_raw(self._process_doc(doc)):
+        for parse_raw, tags_raw, sent in self._batched_parsed_raw(self._process_doc(doc)):
             # The optimized cython decoder implementation doesn't actually
             # generate trees, only scores and span indices. Indices follow a
             # preorder traversal, which is also the order the ConstituentData
@@ -88,6 +94,10 @@ class BeneparComponent(BaseParser):
             constituent_data.starts.append(p_i[valid] + sent.start)
             constituent_data.ends.append(p_j[valid] + sent.start)
             constituent_data.labels.append(p_label[valid])
+
+            if self._do_tagging:
+                for i, tag_idx in enumerate(tags_raw):
+                    sent[i].tag_ = self._tag_vocab[tag_idx]
 
         doc._._constituent_data = constituent_data.finalize(doc, self._label_vocab)
         return doc
@@ -137,7 +147,7 @@ def parse_string(span):
         label = label_vocab[label_idx]
         if (i + 1) >= j:
             token = doc[i]
-            s = "({} {})".format(token.tag_, PTB_TOKEN_ESCAPE.get(token.text, token.text))
+            s = u"({} {})".format(token.tag_, PTB_TOKEN_ESCAPE.get(token.text, token.text))
         else:
             children = []
             while ((idx_cell[0] + 1) < len(constituent_data.starts)
@@ -145,10 +155,10 @@ def parse_string(span):
                 and constituent_data.ends[idx_cell[0] + 1] <= j):
                 children.append(make_str())
 
-            s = " ".join(children)
+            s = u" ".join(children)
 
         for sublabel in reversed(label):
-            s = "({} {})".format(sublabel, s)
+            s = u"({} {})".format(sublabel, s)
         return s
 
     return make_str()
